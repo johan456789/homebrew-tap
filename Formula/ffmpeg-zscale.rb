@@ -22,12 +22,6 @@ class FfmpegZscale < Formula
     depends_on "zlib-ng-compat"
   end
 
-  conflicts_with "ffmpeg", because: "both install ffmpeg, ffprobe, and related binaries"
-  conflicts_with "ffmpeg@7", because: "both install ffmpeg and ffprobe binaries"
-  conflicts_with "ffmpeg@6", because: "both install ffmpeg and ffprobe binaries"
-  conflicts_with "ffmpeg@5", because: "both install ffmpeg and ffprobe binaries"
-  conflicts_with "ffmpeg@4", because: "both install ffmpeg and ffprobe binaries"
-
   def install
     # Avoid duplicate symbol issues with Apple's newer linker.
     if OS.mac? && DevelopmentTools.ld64_version&.between?("1015.7", "1022.1")
@@ -37,12 +31,14 @@ class FfmpegZscale < Formula
     args = %W[
       --prefix=#{prefix}
       --enable-gpl
-      --enable-shared
+      --disable-shared
+      --enable-static
       --enable-pthreads
       --enable-version3
       --cc=#{ENV.cc}
       --host-cflags=#{ENV.cflags}
       --host-ldflags=#{ENV.ldflags}
+      --disable-doc
       --disable-ffplay
       --enable-libx265
       --enable-libzimg
@@ -52,10 +48,18 @@ class FfmpegZscale < Formula
 
     system "./configure", *args
     system "make", "install"
+
+    (bin/"ffmpeg").rename(bin/"ffmpeg-zscale")
+    (bin/"ffprobe").rename(bin/"ffprobe-zscale")
+
+    # Keep the install footprint isolated so core ffmpeg can remain linked.
+    rm_rf lib
+    rm_rf include
+    rm_rf share
   end
 
   test do
-    assert_match "zscale", shell_output("#{bin}/ffmpeg -hide_banner -filters 2>&1")
-    assert_match "libx265", shell_output("#{bin}/ffmpeg -hide_banner -encoders 2>&1")
+    assert_match "zscale", shell_output("#{bin}/ffmpeg-zscale -hide_banner -filters 2>&1")
+    assert_match "libx265", shell_output("#{bin}/ffmpeg-zscale -hide_banner -encoders 2>&1")
   end
 end
