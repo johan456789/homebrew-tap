@@ -1,0 +1,106 @@
+#!/bin/zsh
+# ghspeed - check GitHub/Fastly download health from your current network.
+#
+# Usage: ghspeed [--help] [--version] [URL]
+#   URL defaults to the SideQuest 1.4.1 release asset.
+#
+# Reports the Fastly POP serving you, packet loss to the CDN edge, and
+# real download throughput, then gives an OK / SLOW / DEGRADED verdict.
+
+set -u
+
+VERSION="1.0.0"
+DEFAULT_URL="https://github.com/SideQuestVR/SideQuest/releases/download/v1.4.1/SideQuest-1.4.1-arm64-mac.zip"
+HOST="release-assets.githubusercontent.com"
+
+usage() {
+  cat <<EOF
+ghspeed $VERSION - check GitHub/Fastly download health
+
+Usage:
+  ghspeed [URL]
+
+Runs a quick health check against a GitHub release asset (default: the
+SideQuest 1.4.1 macOS build), reporting the Fastly POP serving you,
+packet loss to the CDN edge, and real download throughput.
+
+Options:
+  -h, --help     Show this help
+  -V, --version  Show version
+EOF
+}
+
+URL=""
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "ghspeed $VERSION"; exit 0 ;;
+    *) URL="$arg" ;;
+  esac
+done
+URL="${URL:-$DEFAULT_URL}"
+
+# Thresholds
+LOSS_WARN=5          # % packet loss considered degraded
+SPEED_OK=2097152     # >= 2 MiB/s is healthy
+SPEED_WARN=307200    # < 300 KiB/s is clearly degraded
+
+red=$'\e[31m'; grn=$'\e[32m'; yel=$'\e[33m'; dim=$'\e[2m'; rst=$'\e[0m'
+
+printf '%sGitHub download health check%s\n' "$dim" "$rst"
+printf '%s%s%s\n\n' "$dim" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$rst"
+
+# 0. VPN state (if windscribe-cli is around)
+vpn="not connected"
+if command -v windscribe-cli >/dev/null 2>&1; then
+  vpn=$(windscribe-cli status 2>/dev/null | sed -n 's/^Connect state: //p' | head -1)
+  [[ -z "$vpn" ]] && vpn="unknown"
+fi
+printf '  VPN:   %s\n' "$vpn"
+
+# 1. Which Fastly POP serves us + which IP we land on
+hdr=$(curl -sIL --max-time 20 "$URL" 2>/dev/null | tr -d '\r')
+pop=$(printf '%s' "$hdr" | sed -n 's/^[Xx]-[Ss]erved-[Bb]y:.*, *\([^ ,]*\)$/\1/p' | tail -1)
+edge=$(printf '%s' "$pop" | sed -n 's/.*-\([A-Z][A-Z][A-Z]\)$/\1/p')
+ip=$(dig +short "$HOST" | head -1)
+
+printf '  POP:   %s\n' "${edge:-unknown} (${pop:-n/a})"
+printf '  Edge:  %s\n' "${ip:-unresolved}"
+
+if [[ -z "${ip:-}" ]]; then
+  printf '\n%sunable to resolve %s%s\n' "$red" "$HOST" "$rst"; exit 1
+fi
+
+# 2. Packet loss to the CDN edge
+loss=$(ping -c 15 -i 0.3 -t 10 "$ip" 2>/dev/null \
+  | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p' | tail -1)
+rtt=$(ping -c 5 -i 0.3 -t 10 "$ip" 2>/dev/null \
+  | sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p' | tail -1)
+printf '  Loss:  %s%%  (rtt %s ms)\n' "${loss:-?}" "${rtt:-?}"
+
+# 3. Throughput: ranged download (~24 MiB or 12s, whichever first)
+read -r spd code dl <<<"$(curl -L -s -r 0-25165824 --max-time 12 -o /dev/null \
+  -w '%{speed_download} %{http_code} %{size_download}' "$URL" 2>/dev/null)"
+mbs=$(printf '%.2f' "$(echo "${spd:-0} * 8 / 1000000" | bc -l 2>/dev/null || echo 0)")
+mibs=$(printf '%.2f' "$(echo "${spd:-0} / 1048576" | bc -l 2>/dev/null || echo 0)")
+printf '  Speed: %s MiB/s (%s Mbit/s, %s bytes in <=12s)\n' "$mibs" "$mbs" "${dl:-0}"
+
+# 4. Verdict (throughput-first; ICMP loss is reported but not decisive)
+verdict="OK"; color="$grn"
+spd_i=${spd%.*}; [[ -z "$spd_i" ]] && spd_i=0
+if (( spd_i < SPEED_WARN )); then
+  verdict="DEGRADED"; color="$red"
+elif (( spd_i < SPEED_OK )); then
+  verdict="SLOW"; color="$yel"
+fi
+
+printf '\n  Verdict: %s%s%s' "$color" "$verdict" "$rst"
+loss_i=${loss%%.*}; [[ -z "$loss_i" ]] && loss_i=0
+if (( loss_i >= LOSS_WARN )); then
+  printf '  %s(high ICMP loss to edge: %s%%)%s' "$dim" "$loss" "$rst"
+fi
+printf '\n'
+
+if [[ "$verdict" != "OK" && "$vpn" == "Disconnected" ]]; then
+  printf '  %sHint: connect a Japan VPN (windscribe-cli connect Japan) to be served from the NRT POP.%s\n' "$dim" "$rst"
+fi
